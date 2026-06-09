@@ -81,7 +81,9 @@ jobs:
             # Silicon AMFI refuses to dlopen (amfid -423 "constraint violation … has
             # entitlements but is not a main binary"), so the RNG reader librdrdsrf
             # never loads and CryptGenRandom blocks. Re-sign adhoc to drop them.
-            sudo find /opt/cprocsp -name '*.dylib' -exec codesign --force --sign - {} \; 2>/dev/null || true
+            echo "=== entitlements BEFORE ==="; codesign -d --entitlements :- /opt/cprocsp/lib/librdrdsrf.4.dylib 2>&1 | head -8 || true
+            echo "=== re-sign CryptoPro dylibs adhoc ==="; sudo find /opt/cprocsp -name '*.dylib' -exec codesign --force --sign - {} \; 2>&1 | tail -15 || true
+            echo "=== entitlements AFTER (want: none) ==="; codesign -d --entitlements :- /opt/cprocsp/lib/librdrdsrf.4.dylib 2>&1 | head -8 || true
             sudo mkdir -p /var/opt/cprocsp/dsrf
             sudo tar xf "$RUNNER_TEMP/dsrf.tar" -C /var/opt/cprocsp/dsrf
             CPCONFIG=/opt/cprocsp/sbin/cpconfig
