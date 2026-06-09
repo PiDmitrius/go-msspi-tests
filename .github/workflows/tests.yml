@@ -113,6 +113,23 @@ jobs:
         curl.exe -sSL -k -o $cacert "$CA/certnew.cer?ReqID=CACert&Renewal=-1&Enc=bin"
         certutil -enterprise -addstore -f root $cacert 2>$null
         if ($LASTEXITCODE -ne 0) { certutil -addstore -f root $cacert 2>$null }
+        # headless GOST key-gen needs the DSRF "source material" RNG, else
+        # cryptcp -creatcert fails with 0x80090022 NTE_SILENT_CONTEXT (KC1 defaults to
+        # the interactive biological RNG). Lay down the dsrf reserve and register it in
+        # BOTH registry views (cryptcp.exe is 32-bit → reads WOW6432Node).
+        $dsrfTar = Join-Path $certs 'dsrf.tar'
+        curl.exe -fsSL -o $dsrfTar "$($env:CPRO_BASE_URL)dsrf.tar"
+        $dsrf = Join-Path $env:RUNNER_TEMP 'dsrf'
+        New-Item -ItemType Directory -Force -Path $dsrf | Out-Null
+        tar.exe -xf $dsrfTar -C $dsrf
+        foreach ($rk in @(
+            'HKLM:\SOFTWARE\Crypto Pro\Cryptography\CurrentVersion\Random\CPSD\Default',
+            'HKLM:\SOFTWARE\WOW6432Node\Crypto Pro\Cryptography\CurrentVersion\Random\CPSD\Default')) {
+          New-Item -Path $rk -Force | Out-Null
+          New-ItemProperty -Path $rk -Name '/db1/kis_1' -Value "$dsrf\db1\kis_1" -PropertyType String -Force | Out-Null
+          New-ItemProperty -Path $rk -Name '/db2/kis_1' -Value "$dsrf\db2\kis_1" -PropertyType String -Force | Out-Null
+          New-ItemProperty -Path $rk -Name 'Level' -Value 1 -PropertyType DWord -Force | Out-Null
+        }
         # issue 4 certs; on Windows the key container is auto-selected (no -cont needed)
         function New-CspCert($provtype, $dn, $usage) {
           & $cryptcp -creatcert -silent -provtype $provtype -dn $dn -certusage $usage -ku -du -both -exprt -ca $CA
