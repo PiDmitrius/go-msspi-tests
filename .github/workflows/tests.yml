@@ -77,6 +77,11 @@ jobs:
             pkg="$(find /Volumes \( -name '*.pkg' -o -name '*.mpkg' \) 2>/dev/null | head -1)"
             echo "installing: $pkg"
             sudo installer -pkg "$pkg" -target /
+            # the dgtry trial dylibs are adhoc-signed WITH entitlements, which Apple
+            # Silicon AMFI refuses to dlopen (amfid -423 "constraint violation … has
+            # entitlements but is not a main binary"), so the RNG reader librdrdsrf
+            # never loads and CryptGenRandom blocks. Re-sign adhoc to drop them.
+            sudo find /opt/cprocsp -name '*.dylib' -exec codesign --force --sign - {} \; 2>/dev/null || true
             sudo mkdir -p /var/opt/cprocsp/dsrf
             sudo tar xf "$RUNNER_TEMP/dsrf.tar" -C /var/opt/cprocsp/dsrf
             CPCONFIG=/opt/cprocsp/sbin/cpconfig
@@ -127,37 +132,7 @@ jobs:
           echo "CSP_CLIENT_RSA_CERT=$certs/client_rsa.cer"
         } >> "$GITHUB_ENV"
 
-    - name: Diagnose macOS RNG hang (cpconfig logging + native sample)
-      if: ${{ matrix.os == 'macos-14' }}
-      env:
-        CGO_ENABLED: '1'
-        GOTOOLCHAIN: local
-      shell: bash
-      run: |
-        CPCONFIG=/opt/cprocsp/sbin/cpconfig
-        echo "=== enable verbose CSP logging (csp, cspr=random, capi20) ==="
-        sudo "$CPCONFIG" -loglevel csp    -mask 0xffffffff || true
-        sudo "$CPCONFIG" -loglevel cspr   -mask 0xffffffff || true
-        sudo "$CPCONFIG" -loglevel capi20 -mask 0xffffffff || true
-        echo "=== compile the msspi-client test binary ==="
-        go test -c -tags=msspi -o "$RUNNER_TEMP/m.test" .
-        echo "=== run TestCrossGoServerMsspiClient in background (it blocks in msspi_connect) ==="
-        "$RUNNER_TEMP/m.test" -test.run '^TestCrossGoServerMsspiClient$' -test.v -test.timeout 90s > "$RUNNER_TEMP/mtest.out" 2>&1 &
-        tpid=$!
-        sleep 30
-        echo "=== sample: native stack of the hung process (pid=$tpid) ==="
-        sample "$tpid" 5 2>&1 | head -160 || true
-        echo "=== CSP / random log file(s), if any ==="
-        sudo find /var /tmp -iname '*cpcsp*' -o -iname '*cprocsp*.log' 2>/dev/null | head || true
-        echo "=== recent unified-log (cprocsp / random) ==="
-        log show --last 2m --predicate 'senderImagePath CONTAINS[c] "cprocsp" OR eventMessage CONTAINS[c] "rnd" OR eventMessage CONTAINS[c] "random" OR eventMessage CONTAINS[c] "dsrf" OR eventMessage CONTAINS[c] "CPSD"' --info --debug 2>/dev/null | tail -120 || true
-        echo "=== test output so far ==="
-        tail -20 "$RUNNER_TEMP/mtest.out" 2>/dev/null || true
-        kill "$tpid" 2>/dev/null || true
-        wait "$tpid" 2>/dev/null || true
-
     - name: Run matrix
-      if: ${{ matrix.os != 'macos-14' }}
       env:
         CGO_ENABLED: '1'
         GOTOOLCHAIN: local
