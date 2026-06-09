@@ -98,39 +98,50 @@ jobs:
       if: ${{ matrix.certs && runner.os == 'Windows' }}
       env:
         CPRO_BASE_URL: ${{ secrets.CPRO_BASE_URL }}
-      shell: bash
+      shell: pwsh
       run: |
-        export MSYS_NO_PATHCONV=1   # keep \\.\REGISTRY\… args from being mangled by Git-bash
-        certs="$(cygpath -u "$RUNNER_TEMP")/certs"; mkdir -p "$certs"
+        $ErrorActionPreference = 'Stop'
+        $CA = 'http://cryptopro.ru/certsrv'
+        $certs = Join-Path $env:RUNNER_TEMP 'certs'
+        New-Item -ItemType Directory -Force -Path $certs | Out-Null
         # cryptcp.exe is a separate Windows download (not bundled in csp-x64.msi)
-        curl -fsSL -o "$(cygpath -w "$certs/cryptcp.exe")" "${CPRO_BASE_URL}cryptcp.exe"
-        CRYPTCP="$certs/cryptcp.exe"
-        CERTMGR="$(find '/c/Program Files' '/c/Program Files (x86)' -iname certmgr.exe 2>/dev/null | head -1)"
-        echo "cryptcp: $CRYPTCP"; echo "certmgr: $CERTMGR"
-        echo "--- CryptoPro .exe tools in install ---"; find '/c/Program Files' '/c/Program Files (x86)' -ipath '*rypto*' -iname '*.exe' 2>/dev/null | head -40
-        CA=http://cryptopro.ru/certsrv
-        # trust the issuing CA root so the chain validates (Windows store, unlike Linux)
-        curl -sSL -k -o "$(cygpath -w "$certs/cacert.cer")" "$CA/certnew.cer?ReqID=CACert&Renewal=-1&Enc=bin" || true
-        certutil -enterprise -addstore -f root "$(cygpath -w "$certs/cacert.cer")" \
-          || certutil -addstore -f root "$(cygpath -w "$certs/cacert.cer")" || true
-        create_cert() {
-          local provtype="$1" dn="$2" container="$3" usage="$4" dest="$5"
-          "$CRYPTCP" -creatcert -silent \
-            -provtype "$provtype" -cont "\\\\.\\REGISTRY\\$container" \
-            -dn "$dn" -certusage "$usage" -ku -du -both -exprt \
-            -ca "$CA"
-          "$CERTMGR" -export -cert -dest "$(cygpath -w "$dest")" -cont "\\\\.\\REGISTRY\\$container"
+        $cryptcp = Join-Path $certs 'cryptcp.exe'
+        curl.exe -fsSL -o $cryptcp "$($env:CPRO_BASE_URL)cryptcp.exe"
+        if ($LASTEXITCODE -ne 0) { throw 'cryptcp.exe download failed' }
+        # trust the issuing CA root (best-effort; the Linux lane does not need it)
+        $cacert = Join-Path $certs 'cacert.cer'
+        curl.exe -sSL -k -o $cacert "$CA/certnew.cer?ReqID=CACert&Renewal=-1&Enc=bin"
+        certutil -enterprise -addstore -f root $cacert 2>$null
+        if ($LASTEXITCODE -ne 0) { certutil -addstore -f root $cacert 2>$null }
+        # issue 4 certs; on Windows the key container is auto-selected (no -cont needed)
+        function New-CspCert($provtype, $dn, $usage) {
+          & $cryptcp -creatcert -silent -provtype $provtype -dn $dn -certusage $usage -ku -du -both -exprt -ca $CA
+          if ($LASTEXITCODE -ne 0) { throw "cryptcp -creatcert failed: $dn provtype=$provtype" }
         }
-        create_cert 80 'CN=127.0.0.1'    server_gost_cont '1.3.6.1.5.5.7.3.1' "$certs/server_gost.cer"
-        create_cert 80 'CN=msspi-client' client_gost_cont '1.3.6.1.5.5.7.3.2' "$certs/client_gost.cer"
-        create_cert 24 'CN=127.0.0.1'    server_rsa_cont  '1.3.6.1.5.5.7.3.1' "$certs/server_rsa.cer"
-        create_cert 24 'CN=msspi-client' client_rsa_cont  '1.3.6.1.5.5.7.3.2' "$certs/client_rsa.cer"
-        {
-          echo "CSP_SERVER_GOST_CERT=$(cygpath -w "$certs/server_gost.cer")"
-          echo "CSP_CLIENT_GOST_CERT=$(cygpath -w "$certs/client_gost.cer")"
-          echo "CSP_SERVER_RSA_CERT=$(cygpath -w "$certs/server_rsa.cer")"
-          echo "CSP_CLIENT_RSA_CERT=$(cygpath -w "$certs/client_rsa.cer")"
-        } >> "$GITHUB_ENV"
+        New-CspCert 80 'CN=127.0.0.1'    '1.3.6.1.5.5.7.3.1'
+        New-CspCert 80 'CN=msspi-client' '1.3.6.1.5.5.7.3.2'
+        New-CspCert 24 'CN=127.0.0.1'    '1.3.6.1.5.5.7.3.1'
+        New-CspCert 24 'CN=msspi-client' '1.3.6.1.5.5.7.3.2'
+        # export each leaf to a DER .cer (the format the fork's X509KeyPair expects);
+        # CN alone is ambiguous (GOST & RSA share it) so also match the key algorithm
+        function Export-Leaf($subject, $gost, $name) {
+          $dest = Join-Path $certs $name
+          $c = Get-ChildItem Cert:\CurrentUser\My | Where-Object {
+            $_.Subject -eq $subject -and ($(if ($gost) { $_.GetKeyAlgorithm() -like '1.2.643.*' } else { $_.GetKeyAlgorithm() -eq '1.2.840.113549.1.1.1' }))
+          } | Select-Object -First 1
+          if (-not $c) { throw "leaf cert not found: $subject gost=$gost" }
+          Export-Certificate -Cert $c -FilePath $dest -Type CERT -Force | Out-Null
+          Write-Host "exported $subject gost=$gost -> $dest"
+          return $dest
+        }
+        $sg = Export-Leaf 'CN=127.0.0.1'    $true  'server_gost.cer'
+        $cg = Export-Leaf 'CN=msspi-client' $true  'client_gost.cer'
+        $sr = Export-Leaf 'CN=127.0.0.1'    $false 'server_rsa.cer'
+        $cr = Export-Leaf 'CN=msspi-client' $false 'client_rsa.cer'
+        Add-Content -Path $env:GITHUB_ENV -Value "CSP_SERVER_GOST_CERT=$sg"
+        Add-Content -Path $env:GITHUB_ENV -Value "CSP_CLIENT_GOST_CERT=$cg"
+        Add-Content -Path $env:GITHUB_ENV -Value "CSP_SERVER_RSA_CERT=$sr"
+        Add-Content -Path $env:GITHUB_ENV -Value "CSP_CLIENT_RSA_CERT=$cr"
 
     - name: Run matrix
       env:
