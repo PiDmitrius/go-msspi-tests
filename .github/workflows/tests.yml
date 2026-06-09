@@ -65,12 +65,20 @@ jobs:
             "$CPCONFIG" -license -set "$LIC"
             ;;
           macOS)
-            # no-cert lane: install only; fresh CSP runs in trial, platform RNG, no certs needed
-            curl -fsSL -o csp.dmg "${CPRO_BASE_URL}ru.cryptopro.csp-cades.dmg"
+            # no-cert lane: install + seed the RNG. Headless macOS has no entropy
+            # source, so msspi_connect blocks generating the ClientHello — mirror
+            # the Linux dsrf reserve fund to unblock it.
+            curl -fsSL -o csp.dmg  "${CPRO_BASE_URL}ru.cryptopro.csp-cades.dmg"
+            curl -fsSL -o dsrf.tar "${CPRO_BASE_URL}dsrf.tar"
             hdiutil attach csp.dmg -nobrowse
             pkg="$(find /Volumes \( -name '*.pkg' -o -name '*.mpkg' \) 2>/dev/null | head -1)"
             echo "installing: $pkg"
             sudo installer -pkg "$pkg" -target /
+            sudo mkdir -p /var/opt/cprocsp/dsrf
+            sudo tar xf "$RUNNER_TEMP/dsrf.tar" -C /var/opt/cprocsp/dsrf
+            echo "--- CSP layout (diagnostic) ---"
+            ls -la /var/opt/cprocsp 2>/dev/null || true
+            sudo find /opt/cprocsp -maxdepth 2 -name cpconfig 2>/dev/null || true
             ;;
           Windows)
             # no-cert lane: install only; fresh CSP runs in trial, platform RNG, no certs needed
