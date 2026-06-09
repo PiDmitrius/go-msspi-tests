@@ -8,7 +8,6 @@ env:
 jobs:
   matrix:
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.experimental || false }}
     strategy:
       fail-fast: false
       matrix:
@@ -16,10 +15,7 @@ jobs:
         - os: ubuntu-latest
           certs: true
         - os: windows-2022
-          certs: false
-        - os: macos-14
-          certs: false
-          experimental: true   # CSP headless RNG still blocks msspi_connect; non-blocking for now
+          certs: true
     name: ${{ matrix.os }}
     steps:
     - uses: actions/checkout@v4
@@ -50,7 +46,6 @@ jobs:
         cd "$RUNNER_TEMP"
         case "$RUNNER_OS" in
           Linux)
-            # full lane: install + dsrf + tweaks + license so certs can be issued
             curl -fsSL -o CSP.tgz  "${CPRO_BASE_URL}linux-amd64_deb.tgz"
             curl -fsSL -o dsrf.tar "${CPRO_BASE_URL}dsrf.tar"
             tar xzf CSP.tgz
@@ -66,49 +61,14 @@ jobs:
             LIC="$(curl -fsSL "${CPRO_BASE_URL}license.txt" | tr -d '[:space:]')"
             "$CPCONFIG" -license -set "$LIC"
             ;;
-          macOS)
-            # no-cert lane: install, lay down the dsrf reserve, and REGISTER the CPSD
-            # random device. The macOS pkg doesn't register it, so CSP falls back to
-            # the blocking biological RNG and msspi_connect hangs generating the
-            # ClientHello. Commands mirror the Linux lsb-cprocsp-rdr-64 postinst.
-            curl -fsSL -o csp.dmg  "${CPRO_BASE_URL}ru.cryptopro.csp-cades.dmg"
-            curl -fsSL -o dsrf.tar "${CPRO_BASE_URL}dsrf.tar"
-            hdiutil attach csp.dmg -nobrowse
-            pkg="$(find /Volumes \( -name '*.pkg' -o -name '*.mpkg' \) 2>/dev/null | head -1)"
-            echo "installing: $pkg"
-            sudo installer -pkg "$pkg" -target /
-            # the dgtry trial dylibs are adhoc-signed WITH entitlements, which Apple
-            # Silicon AMFI refuses to dlopen (amfid -423 "constraint violation … has
-            # entitlements but is not a main binary"), so the RNG reader librdrdsrf
-            # never loads and CryptGenRandom blocks. Re-sign adhoc to drop them.
-            echo "=== entitlements BEFORE ==="; codesign -d --entitlements :- /opt/cprocsp/lib/librdrdsrf.4.dylib 2>&1 | head -8 || true
-            echo "=== re-sign CryptoPro dylibs adhoc ==="; sudo find /opt/cprocsp -name '*.dylib' -exec codesign --force --sign - {} \; 2>&1 | tail -15 || true
-            echo "=== entitlements AFTER (want: none) ==="; codesign -d --entitlements :- /opt/cprocsp/lib/librdrdsrf.4.dylib 2>&1 | head -8 || true
-            sudo mkdir -p /var/opt/cprocsp/dsrf
-            sudo tar xf "$RUNNER_TEMP/dsrf.tar" -C /var/opt/cprocsp/dsrf
-            CPCONFIG=/opt/cprocsp/sbin/cpconfig
-            DSRFLIB="$(sudo find /opt/cprocsp -name 'librdrdsrf*' 2>/dev/null | head -1)"
-            echo "dsrf lib: $DSRFLIB"
-            sudo "$CPCONFIG" -ini '\config\apppath' -add string librdrdsrf.so "$DSRFLIB"
-            sudo "$CPCONFIG" -hardware rndm -add CPSD -name 'CPSD RNG' -level 3
-            sudo "$CPCONFIG" -ini '\config\Random\CPSD\Default' -add string '/db1/kis_1' /var/opt/cprocsp/dsrf/db1/kis_1
-            sudo "$CPCONFIG" -ini '\config\Random\CPSD\Default' -add string '/db2/kis_1' /var/opt/cprocsp/dsrf/db2/kis_1
-            # the CPSD reserve is read-write at runtime — the runner user must own it
-            # (the Linux lane chowns dsrf too); without write access CSP can't update
-            # the reserve and falls back to the blocking biological RNG.
-            sudo mkdir -p /var/opt/cprocsp/tmp
-            sudo chown -R "$(id -un)" /var/opt/cprocsp/dsrf /var/opt/cprocsp/tmp /etc/opt/cprocsp
-            sudo "$CPCONFIG" -hardware rndm -view
-            ;;
           Windows)
-            # no-cert lane: install only; fresh CSP runs in trial, platform RNG, no certs needed
             curl -fsSL -o csp.msi "${CPRO_BASE_URL}csp-x64.msi"
             start //wait msiexec //qn //i csp.msi REBOOT=R KCLEVEL=1
             ;;
         esac
 
-    - name: Issue CSP certificates (GOST + RSA, server + client)
-      if: ${{ matrix.certs }}
+    - name: Issue CSP certificates (Linux, GOST + RSA, server + client)
+      if: ${{ matrix.certs && runner.os == 'Linux' }}
       shell: bash
       run: |
         CRYPTCP=/opt/cprocsp/bin/amd64/cryptcp
@@ -132,6 +92,41 @@ jobs:
           echo "CSP_CLIENT_GOST_CERT=$certs/client_gost.cer"
           echo "CSP_SERVER_RSA_CERT=$certs/server_rsa.cer"
           echo "CSP_CLIENT_RSA_CERT=$certs/client_rsa.cer"
+        } >> "$GITHUB_ENV"
+
+    - name: Issue CSP certificates (Windows, GOST + RSA, server + client)
+      if: ${{ matrix.certs && runner.os == 'Windows' }}
+      shell: bash
+      run: |
+        export MSYS_NO_PATHCONV=1   # keep \\.\REGISTRY\… args from being mangled by Git-bash
+        for d in "/c/Program Files/Crypto Pro/CSP" "/c/Program Files (x86)/Crypto Pro/CSP"; do
+          [ -x "$d/cryptcp.exe" ] && CPDIR="$d" && break
+        done
+        echo "CSP tools dir: $CPDIR"
+        CRYPTCP="$CPDIR/cryptcp.exe"; CERTMGR="$CPDIR/certmgr.exe"
+        CA=http://cryptopro.ru/certsrv
+        certs="$(cygpath -u "$RUNNER_TEMP")/certs"; mkdir -p "$certs"
+        # trust the issuing CA root so the chain validates (Windows store, unlike Linux)
+        curl -sSL -k -o "$certs/cacert.cer" "$CA/certnew.cer?ReqID=CACert&Renewal=-1&Enc=bin"
+        certutil -enterprise -addstore -f root "$(cygpath -w "$certs/cacert.cer")" \
+          || certutil -addstore -f root "$(cygpath -w "$certs/cacert.cer")" || true
+        create_cert() {
+          local provtype="$1" dn="$2" container="$3" usage="$4" dest="$5"
+          "$CRYPTCP" -creatcert -silent \
+            -provtype "$provtype" -cont "\\\\.\\REGISTRY\\$container" \
+            -dn "$dn" -certusage "$usage" -ku -du -both -exprt \
+            -ca "$CA"
+          "$CERTMGR" -export -cert -dest "$(cygpath -w "$dest")" -cont "\\\\.\\REGISTRY\\$container"
+        }
+        create_cert 80 'CN=127.0.0.1'    server_gost_cont '1.3.6.1.5.5.7.3.1' "$certs/server_gost.cer"
+        create_cert 80 'CN=msspi-client' client_gost_cont '1.3.6.1.5.5.7.3.2' "$certs/client_gost.cer"
+        create_cert 24 'CN=127.0.0.1'    server_rsa_cont  '1.3.6.1.5.5.7.3.1' "$certs/server_rsa.cer"
+        create_cert 24 'CN=msspi-client' client_rsa_cont  '1.3.6.1.5.5.7.3.2' "$certs/client_rsa.cer"
+        {
+          echo "CSP_SERVER_GOST_CERT=$(cygpath -w "$certs/server_gost.cer")"
+          echo "CSP_CLIENT_GOST_CERT=$(cygpath -w "$certs/client_gost.cer")"
+          echo "CSP_SERVER_RSA_CERT=$(cygpath -w "$certs/server_rsa.cer")"
+          echo "CSP_CLIENT_RSA_CERT=$(cygpath -w "$certs/client_rsa.cer")"
         } >> "$GITHUB_ENV"
 
     - name: Run matrix
