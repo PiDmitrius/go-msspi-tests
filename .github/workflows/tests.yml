@@ -84,6 +84,11 @@ jobs:
             sudo "$CPCONFIG" -hardware rndm -add CPSD -name 'CPSD RNG' -level 3
             sudo "$CPCONFIG" -ini '\config\Random\CPSD\Default' -add string '/db1/kis_1' /var/opt/cprocsp/dsrf/db1/kis_1
             sudo "$CPCONFIG" -ini '\config\Random\CPSD\Default' -add string '/db2/kis_1' /var/opt/cprocsp/dsrf/db2/kis_1
+            # the CPSD reserve is read-write at runtime — the runner user must own it
+            # (the Linux lane chowns dsrf too); without write access CSP can't update
+            # the reserve and falls back to the blocking biological RNG.
+            sudo mkdir -p /var/opt/cprocsp/tmp
+            sudo chown -R "$(id -un)" /var/opt/cprocsp/dsrf /var/opt/cprocsp/tmp /etc/opt/cprocsp
             sudo "$CPCONFIG" -hardware rndm -view
             ;;
           Windows)
