@@ -65,9 +65,10 @@ jobs:
             "$CPCONFIG" -license -set "$LIC"
             ;;
           macOS)
-            # no-cert lane: install + seed the RNG. Headless macOS has no entropy
-            # source, so msspi_connect blocks generating the ClientHello — mirror
-            # the Linux dsrf reserve fund to unblock it.
+            # no-cert lane: install, lay down the dsrf reserve, and REGISTER the CPSD
+            # random device. The macOS pkg doesn't register it, so CSP falls back to
+            # the blocking biological RNG and msspi_connect hangs generating the
+            # ClientHello. Commands mirror the Linux lsb-cprocsp-rdr-64 postinst.
             curl -fsSL -o csp.dmg  "${CPRO_BASE_URL}ru.cryptopro.csp-cades.dmg"
             curl -fsSL -o dsrf.tar "${CPRO_BASE_URL}dsrf.tar"
             hdiutil attach csp.dmg -nobrowse
@@ -76,9 +77,14 @@ jobs:
             sudo installer -pkg "$pkg" -target /
             sudo mkdir -p /var/opt/cprocsp/dsrf
             sudo tar xf "$RUNNER_TEMP/dsrf.tar" -C /var/opt/cprocsp/dsrf
-            echo "--- CSP layout (diagnostic) ---"
-            ls -la /var/opt/cprocsp 2>/dev/null || true
-            sudo find /opt/cprocsp -maxdepth 2 -name cpconfig 2>/dev/null || true
+            CPCONFIG=/opt/cprocsp/sbin/cpconfig
+            DSRFLIB="$(sudo find /opt/cprocsp -name 'librdrdsrf*' 2>/dev/null | head -1)"
+            echo "dsrf lib: $DSRFLIB"
+            sudo "$CPCONFIG" -ini '\config\apppath' -add string librdrdsrf.so "$DSRFLIB"
+            sudo "$CPCONFIG" -hardware rndm -add CPSD -name 'CPSD RNG' -level 3
+            sudo "$CPCONFIG" -ini '\config\Random\CPSD\Default' -add string '/db1/kis_1' /var/opt/cprocsp/dsrf/db1/kis_1
+            sudo "$CPCONFIG" -ini '\config\Random\CPSD\Default' -add string '/db2/kis_1' /var/opt/cprocsp/dsrf/db2/kis_1
+            sudo "$CPCONFIG" -hardware rndm -view
             ;;
           Windows)
             # no-cert lane: install only; fresh CSP runs in trial, platform RNG, no certs needed
