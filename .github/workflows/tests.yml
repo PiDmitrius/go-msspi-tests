@@ -96,19 +96,19 @@ jobs:
 
     - name: Issue CSP certificates (Windows, GOST + RSA, server + client)
       if: ${{ matrix.certs && runner.os == 'Windows' }}
+      env:
+        CPRO_BASE_URL: ${{ secrets.CPRO_BASE_URL }}
       shell: bash
       run: |
         export MSYS_NO_PATHCONV=1   # keep \\.\REGISTRY\… args from being mangled by Git-bash
-        CRYPTCP="$(find '/c/Program Files' '/c/Program Files (x86)' -iname cryptcp.exe 2>/dev/null | head -1)"
+        certs="$(cygpath -u "$RUNNER_TEMP")/certs"; mkdir -p "$certs"
+        # cryptcp.exe is a separate Windows download (not bundled in csp-x64.msi)
+        curl -fsSL -o "$(cygpath -w "$certs/cryptcp.exe")" "${CPRO_BASE_URL}cryptcp.exe"
+        CRYPTCP="$certs/cryptcp.exe"
         CERTMGR="$(find '/c/Program Files' '/c/Program Files (x86)' -iname certmgr.exe 2>/dev/null | head -1)"
         echo "cryptcp: $CRYPTCP"; echo "certmgr: $CERTMGR"
-        if [ -z "$CRYPTCP" ]; then
-          echo "cryptcp.exe not found — CryptoPro .exe tools present:"
-          find '/c/Program Files' '/c/Program Files (x86)' -ipath '*rypto*' -iname '*.exe' 2>/dev/null | head -40
-          exit 1
-        fi
+        echo "--- CryptoPro .exe tools in install ---"; find '/c/Program Files' '/c/Program Files (x86)' -ipath '*rypto*' -iname '*.exe' 2>/dev/null | head -40
         CA=http://cryptopro.ru/certsrv
-        certs="$(cygpath -u "$RUNNER_TEMP")/certs"; mkdir -p "$certs"
         # trust the issuing CA root so the chain validates (Windows store, unlike Linux)
         curl -sSL -k -o "$(cygpath -w "$certs/cacert.cer")" "$CA/certnew.cer?ReqID=CACert&Renewal=-1&Enc=bin" || true
         certutil -enterprise -addstore -f root "$(cygpath -w "$certs/cacert.cer")" \
