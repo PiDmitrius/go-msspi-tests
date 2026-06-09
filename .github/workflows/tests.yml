@@ -6,16 +6,21 @@ env:
   go-cpro-version: 'v1.26.4-msspi-1'
 
 jobs:
-  matrix:
+  test:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-        - os: ubuntu-latest
+        - os: ubuntu-latest    # full matrix + MSSPI_EXTERNAL, with CSP certificates
+          tests: true
           certs: true
-        - os: windows-2022
-          certs: true
+        - os: windows-2022     # MSSPI_EXTERNAL + no-cert subset (CSP-cert tests skip)
+          tests: true
+          certs: false
+        - os: macos-14         # build only — proves the binding compiles on Apple Silicon
+          tests: false
+          certs: false
     name: ${{ matrix.os }}
     steps:
     - uses: actions/checkout@v4
@@ -38,7 +43,17 @@ jobs:
         if [ "$RUNNER_OS" != "Windows" ]; then make -B static-capix; fi
         cp -rf "$RUNNER_TEMP/go/src" "$(go env GOROOT)"
 
+    - name: Build only (compile the test binary, no runtime)
+      if: ${{ !matrix.tests }}
+      env:
+        CGO_ENABLED: '1'
+        GOTOOLCHAIN: local
+      shell: bash
+      run: |
+        go test -tags=msspi -c -o "$RUNNER_TEMP/msspitests.test" .
+
     - name: Install CryptoPro CSP
+      if: ${{ matrix.tests }}
       env:
         CPRO_BASE_URL: ${{ secrets.CPRO_BASE_URL }}
       shell: bash
@@ -67,8 +82,8 @@ jobs:
             ;;
         esac
 
-    - name: Issue CSP certificates (Linux, GOST + RSA, server + client)
-      if: ${{ matrix.certs && runner.os == 'Linux' }}
+    - name: Issue CSP certificates (GOST + RSA, server + client)
+      if: ${{ matrix.certs }}
       shell: bash
       run: |
         CRYPTCP=/opt/cprocsp/bin/amd64/cryptcp
@@ -94,85 +109,8 @@ jobs:
           echo "CSP_CLIENT_RSA_CERT=$certs/client_rsa.cer"
         } >> "$GITHUB_ENV"
 
-    - name: Issue CSP certificates (Windows, GOST + RSA, server + client)
-      if: ${{ matrix.certs && runner.os == 'Windows' }}
-      env:
-        CPRO_BASE_URL: ${{ secrets.CPRO_BASE_URL }}
-      shell: pwsh
-      run: |
-        $ErrorActionPreference = 'Stop'
-        $CA = 'http://cryptopro.ru/certsrv'
-        $certs = Join-Path $env:RUNNER_TEMP 'certs'
-        New-Item -ItemType Directory -Force -Path $certs | Out-Null
-        # cryptcp.exe is a separate Windows download (not bundled in csp-x64.msi)
-        $cryptcp = Join-Path $certs 'cryptcp.exe'
-        curl.exe -fsSL -o $cryptcp "$($env:CPRO_BASE_URL)cryptcp.exe"
-        if ($LASTEXITCODE -ne 0) { throw 'cryptcp.exe download failed' }
-        # trust the issuing CA root (best-effort; the Linux lane does not need it)
-        $cacert = Join-Path $certs 'cacert.cer'
-        curl.exe -sSL -k -o $cacert "$CA/certnew.cer?ReqID=CACert&Renewal=-1&Enc=bin"
-        certutil -enterprise -addstore -f root $cacert 2>$null
-        if ($LASTEXITCODE -ne 0) { certutil -addstore -f root $cacert 2>$null }
-        # headless GOST key-gen needs the DSRF "source material" RNG, else
-        # cryptcp -creatcert fails with 0x80090022 NTE_SILENT_CONTEXT (KC1 defaults to
-        # the interactive biological RNG). Lay down the dsrf reserve and register it in
-        # BOTH registry views (cryptcp.exe is 32-bit → reads WOW6432Node).
-        $dsrfTar = Join-Path $certs 'dsrf.tar'
-        curl.exe -fsSL -o $dsrfTar "$($env:CPRO_BASE_URL)dsrf.tar"
-        $dsrf = Join-Path $env:RUNNER_TEMP 'dsrf'
-        New-Item -ItemType Directory -Force -Path $dsrf | Out-Null
-        tar.exe -xf $dsrfTar -C $dsrf
-        foreach ($rk in @(
-            'HKLM:\SOFTWARE\Crypto Pro\Cryptography\CurrentVersion\Random\CPSD\Default',
-            'HKLM:\SOFTWARE\WOW6432Node\Crypto Pro\Cryptography\CurrentVersion\Random\CPSD\Default')) {
-          New-Item -Path $rk -Force | Out-Null
-          New-ItemProperty -Path $rk -Name '/db1/kis_1' -Value "$dsrf\db1\kis_1" -PropertyType String -Force | Out-Null
-          New-ItemProperty -Path $rk -Name '/db2/kis_1' -Value "$dsrf\db2\kis_1" -PropertyType String -Force | Out-Null
-          New-ItemProperty -Path $rk -Name 'Level' -Value 1 -PropertyType DWord -Force | Out-Null
-        }
-        # the Default data paths alone aren't enough — the CPSD device must be REGISTERED
-        # in the RNG list (Linux does `cpconfig -hardware rndm -add CPSD`). Windows ships
-        # cpconfig.exe; find it and add the device, made most-preferred (-level 1).
-        $cpconfig = (Get-ChildItem 'C:\Program Files\Crypto Pro','C:\Program Files (x86)\Crypto Pro' -Recurse -Filter 'cpconfig*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
-        Write-Host "cpconfig: $cpconfig"
-        if ($cpconfig) {
-          & $cpconfig -hardware rndm -add CPSD -name 'CPSD RNG' -level 1 2>&1 | Write-Host
-          & $cpconfig -hardware rndm -view 2>&1 | Write-Host
-        } else {
-          Write-Host 'cpconfig.exe NOT found - CryptoPro exes present:'
-          Get-ChildItem 'C:\Program Files\Crypto Pro','C:\Program Files (x86)\Crypto Pro' -Recurse -Filter '*.exe' -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
-        }
-        # issue 4 certs; on Windows the key container is auto-selected (no -cont needed)
-        function New-CspCert($provtype, $dn, $usage) {
-          & $cryptcp -creatcert -silent -provtype $provtype -dn $dn -certusage $usage -ku -du -both -exprt -ca $CA
-          if ($LASTEXITCODE -ne 0) { throw "cryptcp -creatcert failed: $dn provtype=$provtype" }
-        }
-        New-CspCert 80 'CN=127.0.0.1'    '1.3.6.1.5.5.7.3.1'
-        New-CspCert 80 'CN=msspi-client' '1.3.6.1.5.5.7.3.2'
-        New-CspCert 24 'CN=127.0.0.1'    '1.3.6.1.5.5.7.3.1'
-        New-CspCert 24 'CN=msspi-client' '1.3.6.1.5.5.7.3.2'
-        # export each leaf to a DER .cer (the format the fork's X509KeyPair expects);
-        # CN alone is ambiguous (GOST & RSA share it) so also match the key algorithm
-        function Export-Leaf($subject, $gost, $name) {
-          $dest = Join-Path $certs $name
-          $c = Get-ChildItem Cert:\CurrentUser\My | Where-Object {
-            $_.Subject -eq $subject -and ($(if ($gost) { $_.GetKeyAlgorithm() -like '1.2.643.*' } else { $_.GetKeyAlgorithm() -eq '1.2.840.113549.1.1.1' }))
-          } | Select-Object -First 1
-          if (-not $c) { throw "leaf cert not found: $subject gost=$gost" }
-          Export-Certificate -Cert $c -FilePath $dest -Type CERT -Force | Out-Null
-          Write-Host "exported $subject gost=$gost -> $dest"
-          return $dest
-        }
-        $sg = Export-Leaf 'CN=127.0.0.1'    $true  'server_gost.cer'
-        $cg = Export-Leaf 'CN=msspi-client' $true  'client_gost.cer'
-        $sr = Export-Leaf 'CN=127.0.0.1'    $false 'server_rsa.cer'
-        $cr = Export-Leaf 'CN=msspi-client' $false 'client_rsa.cer'
-        Add-Content -Path $env:GITHUB_ENV -Value "CSP_SERVER_GOST_CERT=$sg"
-        Add-Content -Path $env:GITHUB_ENV -Value "CSP_CLIENT_GOST_CERT=$cg"
-        Add-Content -Path $env:GITHUB_ENV -Value "CSP_SERVER_RSA_CERT=$sr"
-        Add-Content -Path $env:GITHUB_ENV -Value "CSP_CLIENT_RSA_CERT=$cr"
-
-    - name: Run matrix
+    - name: Run tests (matrix + MSSPI_EXTERNAL; CSP-cert tests skip without certs)
+      if: ${{ matrix.tests }}
       env:
         CGO_ENABLED: '1'
         GOTOOLCHAIN: local
