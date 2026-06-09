@@ -2,71 +2,85 @@ name: tests
 on: push
 
 env:
-  golang-version: '1.22.6'
-  go-cpro-version: 'v1.22.6-msspi-5'
+  golang-version: '1.26.4'
+  go-cpro-version: 'v1.26.4-msspi-1'
 
 jobs:
-  test:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-        - os: windows-2019
-          platform: win64
-        - os: ubuntu-latest
-          platform: linux
-        - os: macos-latest
-          platform: darwin
-
-    name: TLS-Client
+  matrix:
+    runs-on: ubuntu-latest
+    name: matrix (ubuntu-latest)
     steps:
     - uses: actions/checkout@v4
+
     - uses: actions/setup-go@v5
       with:
         go-version: ${{ env.golang-version }}
 
-    - name: Setup CryptoPro/go
+    - name: Setup CryptoPro/go (modified stdlib + msspi .a)
       env:
         PROJECTTAG: ${{ env.go-cpro-version }}
       shell: bash
       run: |
-        cd $RUNNER_TEMP
-        git -c advice.detachedHead=false clone --depth 1 --branch ${PROJECTTAG} https://github.com/CryptoPro/go.git
+        cd "$RUNNER_TEMP"
+        git -c advice.detachedHead=false clone --depth 1 --branch "$PROJECTTAG" https://github.com/CryptoPro/go.git
         cd go
         git submodule update --init --recursive --depth 1
-        cd src/go-msspi/msspi/build_linux
-        make -B static
-        if [ "$RUNNER_OS" != "Windows" ]; then
-          make -B static-capix
-        fi
-        go env
-        env
-        cp -rf $RUNNER_TEMP/go/src $(go env GOROOT)
+        ( cd src/go-msspi/msspi/build_linux && make -B static && make -B static-capix )
+        cp -rf "$RUNNER_TEMP/go/src" "$(go env GOROOT)"
 
-    - name: Install CryptoPro CSP
+    - name: Install CryptoPro CSP (+ dsrf + license)
       env:
-        CPRO_CREDENTIALS: ${{ secrets.CPRO_CREDENTIALS }}
+        CPRO_BASE_URL: ${{ secrets.CPRO_BASE_URL }}
       shell: bash
       run: |
-        cd $RUNNER_TEMP
-        if [ "$RUNNER_OS" == "Windows" ]; then
-          curl https://${CPRO_CREDENTIALS}@update.cryptopro.ru/support/stunnel/dist/csp50r3_13000/csp-x64-eng.msi --output csp-x64-eng.msi
-          start //wait msiexec //qn //i "csp-x64-eng.msi" REBOOT=R KCLEVEL=1
-        elif [ "$RUNNER_OS" == "Linux" ]; then
-          curl https://${CPRO_CREDENTIALS}@update.cryptopro.ru/support/stunnel/dist/csp50r3_13000/linux-amd64_deb.tgz --output linux-amd64_deb.tgz
-          tar -xvf linux-amd64_deb.tgz
-          cd linux-amd64_deb
-          sudo ./install.sh kc1
-        elif [ "$RUNNER_OS" == "macOS" ]; then
-          curl https://${CPRO_CREDENTIALS}@update.cryptopro.ru/support/stunnel/dist/csp50r3_13000/ru.cryptopro.csp.dmg --output ru.cryptopro.csp.dmg
-          hdiutil attach ru.cryptopro.csp.dmg
-          cd /Volumes/ru.cryptopro.csp*
-          sudo installer -pkg ru.cryptopro.csp*.pkg -target /
-        else
-          exit 1
-        fi
+        cd "$RUNNER_TEMP"
+        curl -fsSL -o CSP.tgz  "${CPRO_BASE_URL}linux-amd64_deb.tgz"
+        curl -fsSL -o dsrf.tar "${CPRO_BASE_URL}dsrf.tar"
+        tar xzf CSP.tgz
+        ( cd linux-amd64_deb && sudo ./install.sh kc1 )
+        sudo mkdir -p /var/opt/cprocsp/dsrf
+        sudo tar xf "$RUNNER_TEMP/dsrf.tar" -C /var/opt/cprocsp/dsrf
+        CPCONFIG=/opt/cprocsp/sbin/amd64/cpconfig
+        sudo "$CPCONFIG" -ini '\config\keydevices\hdimage\default' -add long 'long_names' 1
+        sudo "$CPCONFIG" -ini '\config\parameters' -add long 'dynamic_readers' 0
+        # let the runner user drive the CSP (issue certs, set license) without sudo
+        me="$(id -un):$(id -gn)"
+        sudo mkdir -p "/var/opt/cprocsp/keys/$(id -un)" "/var/opt/cprocsp/users/$(id -un)" /var/opt/cprocsp/tmp
+        sudo chown -R "$me" /etc/opt/cprocsp /var/opt/cprocsp/keys /var/opt/cprocsp/users /var/opt/cprocsp/tmp /var/opt/cprocsp/dsrf
+        LIC="$(curl -fsSL "${CPRO_BASE_URL}license.txt" | tr -d '[:space:]')"
+        "$CPCONFIG" -license -set "$LIC"
+        "$CPCONFIG" -license -view
 
-    - name: TLS-Client
+    - name: Issue CSP certificates (GOST + RSA, server + client)
+      shell: bash
       run: |
-        go test -run MsspiClient
+        CRYPTCP=/opt/cprocsp/bin/amd64/cryptcp
+        CERTMGR=/opt/cprocsp/bin/amd64/certmgr
+        CA=http://cryptopro.ru/certsrv
+        certs="$RUNNER_TEMP/certs"; mkdir -p "$certs"
+        create_cert() {
+          local provtype="$1" dn="$2" container="$3" usage="$4" dest="$5"
+          printf 'o\n' | "$CRYPTCP" -creatcert \
+            -provtype "$provtype" -cont "\\\\.\\HDIMAGE\\$container" \
+            -dn "$dn" -certusage "$usage" -ku -du -both -exprt \
+            -tpassword '' -pin '' -ca "$CA"
+          "$CERTMGR" -export -cert -dest "$dest" -cont "\\\\.\\HDIMAGE\\$container"
+        }
+        create_cert 80 'CN=127.0.0.1'    server_gost_cont '1.3.6.1.5.5.7.3.1' "$certs/server_gost.cer"
+        create_cert 80 'CN=msspi-client' client_gost_cont '1.3.6.1.5.5.7.3.2' "$certs/client_gost.cer"
+        create_cert 24 'CN=127.0.0.1'    server_rsa_cont  '1.3.6.1.5.5.7.3.1' "$certs/server_rsa.cer"
+        create_cert 24 'CN=msspi-client' client_rsa_cont  '1.3.6.1.5.5.7.3.2' "$certs/client_rsa.cer"
+        {
+          echo "CSP_SERVER_GOST_CERT=$certs/server_gost.cer"
+          echo "CSP_CLIENT_GOST_CERT=$certs/client_gost.cer"
+          echo "CSP_SERVER_RSA_CERT=$certs/server_rsa.cer"
+          echo "CSP_CLIENT_RSA_CERT=$certs/client_rsa.cer"
+        } >> "$GITHUB_ENV"
+
+    - name: Run matrix
+      env:
+        CGO_ENABLED: '1'
+        GOTOOLCHAIN: local
+      shell: bash
+      run: |
+        go test -tags=msspi -v -count=1 ./...
