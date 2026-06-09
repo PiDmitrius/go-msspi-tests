@@ -7,8 +7,18 @@ env:
 
 jobs:
   matrix:
-    runs-on: ubuntu-latest
-    name: matrix (ubuntu-latest)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - os: ubuntu-latest
+          certs: true
+        - os: macos-13
+          certs: false
+        - os: windows-2019
+          certs: false
+    name: ${{ matrix.os }}
     steps:
     - uses: actions/checkout@v4
 
@@ -25,33 +35,52 @@ jobs:
         git -c advice.detachedHead=false clone --depth 1 --branch "$PROJECTTAG" https://github.com/CryptoPro/go.git
         cd go
         git submodule update --init --recursive --depth 1
-        ( cd src/go-msspi/msspi/build_linux && make -B static && make -B static-capix )
+        cd src/go-msspi/msspi/build_linux
+        make -B static
+        if [ "$RUNNER_OS" != "Windows" ]; then make -B static-capix; fi
         cp -rf "$RUNNER_TEMP/go/src" "$(go env GOROOT)"
 
-    - name: Install CryptoPro CSP (+ dsrf + license)
+    - name: Install CryptoPro CSP
       env:
         CPRO_BASE_URL: ${{ secrets.CPRO_BASE_URL }}
       shell: bash
       run: |
         cd "$RUNNER_TEMP"
-        curl -fsSL -o CSP.tgz  "${CPRO_BASE_URL}linux-amd64_deb.tgz"
-        curl -fsSL -o dsrf.tar "${CPRO_BASE_URL}dsrf.tar"
-        tar xzf CSP.tgz
-        ( cd linux-amd64_deb && sudo ./install.sh kc1 )
-        sudo mkdir -p /var/opt/cprocsp/dsrf
-        sudo tar xf "$RUNNER_TEMP/dsrf.tar" -C /var/opt/cprocsp/dsrf
-        CPCONFIG=/opt/cprocsp/sbin/amd64/cpconfig
-        sudo "$CPCONFIG" -ini '\config\keydevices\hdimage\default' -add long 'long_names' 1
-        sudo "$CPCONFIG" -ini '\config\parameters' -add long 'dynamic_readers' 0
-        # let the runner user drive the CSP (issue certs, set license) without sudo
-        me="$(id -un):$(id -gn)"
-        sudo mkdir -p "/var/opt/cprocsp/keys/$(id -un)" "/var/opt/cprocsp/users/$(id -un)" /var/opt/cprocsp/tmp
-        sudo chown -R "$me" /etc/opt/cprocsp /var/opt/cprocsp/keys /var/opt/cprocsp/users /var/opt/cprocsp/tmp /var/opt/cprocsp/dsrf
-        LIC="$(curl -fsSL "${CPRO_BASE_URL}license.txt" | tr -d '[:space:]')"
-        "$CPCONFIG" -license -set "$LIC"
-        "$CPCONFIG" -license -view
+        case "$RUNNER_OS" in
+          Linux)
+            # full lane: install + dsrf + tweaks + license so certs can be issued
+            curl -fsSL -o CSP.tgz  "${CPRO_BASE_URL}linux-amd64_deb.tgz"
+            curl -fsSL -o dsrf.tar "${CPRO_BASE_URL}dsrf.tar"
+            tar xzf CSP.tgz
+            ( cd linux-amd64_deb && sudo ./install.sh kc1 )
+            sudo mkdir -p /var/opt/cprocsp/dsrf
+            sudo tar xf "$RUNNER_TEMP/dsrf.tar" -C /var/opt/cprocsp/dsrf
+            CPCONFIG=/opt/cprocsp/sbin/amd64/cpconfig
+            sudo "$CPCONFIG" -ini '\config\keydevices\hdimage\default' -add long 'long_names' 1
+            sudo "$CPCONFIG" -ini '\config\parameters' -add long 'dynamic_readers' 0
+            me="$(id -un):$(id -gn)"
+            sudo mkdir -p "/var/opt/cprocsp/keys/$(id -un)" "/var/opt/cprocsp/users/$(id -un)" /var/opt/cprocsp/tmp
+            sudo chown -R "$me" /etc/opt/cprocsp /var/opt/cprocsp/keys /var/opt/cprocsp/users /var/opt/cprocsp/tmp /var/opt/cprocsp/dsrf
+            LIC="$(curl -fsSL "${CPRO_BASE_URL}license.txt" | tr -d '[:space:]')"
+            "$CPCONFIG" -license -set "$LIC"
+            ;;
+          macOS)
+            # no-cert lane: install only; fresh CSP runs in trial, platform RNG, no certs needed
+            curl -fsSL -o csp.dmg "${CPRO_BASE_URL}ru.cryptopro.csp-cades.dmg"
+            hdiutil attach csp.dmg -nobrowse
+            pkg="$(find /Volumes \( -name '*.pkg' -o -name '*.mpkg' \) 2>/dev/null | head -1)"
+            echo "installing: $pkg"
+            sudo installer -pkg "$pkg" -target /
+            ;;
+          Windows)
+            # no-cert lane: install only; fresh CSP runs in trial, platform RNG, no certs needed
+            curl -fsSL -o csp.msi "${CPRO_BASE_URL}csp-x64.msi"
+            start //wait msiexec //qn //i csp.msi REBOOT=R KCLEVEL=1
+            ;;
+        esac
 
     - name: Issue CSP certificates (GOST + RSA, server + client)
+      if: ${{ matrix.certs }}
       shell: bash
       run: |
         CRYPTCP=/opt/cprocsp/bin/amd64/cryptcp
