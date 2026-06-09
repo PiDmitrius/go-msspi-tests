@@ -14,9 +14,9 @@ jobs:
         include:
         - os: ubuntu-latest
           certs: true
-        - os: macos-13
+        - os: macos-14
           certs: false
-        - os: windows-2019
+        - os: windows-2022
           certs: false
     name: ${{ matrix.os }}
     steps:
