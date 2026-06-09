@@ -130,6 +130,18 @@ jobs:
           New-ItemProperty -Path $rk -Name '/db2/kis_1' -Value "$dsrf\db2\kis_1" -PropertyType String -Force | Out-Null
           New-ItemProperty -Path $rk -Name 'Level' -Value 1 -PropertyType DWord -Force | Out-Null
         }
+        # the Default data paths alone aren't enough — the CPSD device must be REGISTERED
+        # in the RNG list (Linux does `cpconfig -hardware rndm -add CPSD`). Windows ships
+        # cpconfig.exe; find it and add the device, made most-preferred (-level 1).
+        $cpconfig = (Get-ChildItem 'C:\Program Files\Crypto Pro','C:\Program Files (x86)\Crypto Pro' -Recurse -Filter 'cpconfig*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+        Write-Host "cpconfig: $cpconfig"
+        if ($cpconfig) {
+          & $cpconfig -hardware rndm -add CPSD -name 'CPSD RNG' -level 1 2>&1 | Write-Host
+          & $cpconfig -hardware rndm -view 2>&1 | Write-Host
+        } else {
+          Write-Host 'cpconfig.exe NOT found - CryptoPro exes present:'
+          Get-ChildItem 'C:\Program Files\Crypto Pro','C:\Program Files (x86)\Crypto Pro' -Recurse -Filter '*.exe' -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
+        }
         # issue 4 certs; on Windows the key container is auto-selected (no -cont needed)
         function New-CspCert($provtype, $dn, $usage) {
           & $cryptcp -creatcert -silent -provtype $provtype -dn $dn -certusage $usage -ku -du -both -exprt -ca $CA
