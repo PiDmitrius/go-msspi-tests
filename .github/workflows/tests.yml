@@ -99,15 +99,18 @@ jobs:
       shell: bash
       run: |
         export MSYS_NO_PATHCONV=1   # keep \\.\REGISTRY\… args from being mangled by Git-bash
-        for d in "/c/Program Files/Crypto Pro/CSP" "/c/Program Files (x86)/Crypto Pro/CSP"; do
-          [ -x "$d/cryptcp.exe" ] && CPDIR="$d" && break
-        done
-        echo "CSP tools dir: $CPDIR"
-        CRYPTCP="$CPDIR/cryptcp.exe"; CERTMGR="$CPDIR/certmgr.exe"
+        CRYPTCP="$(find '/c/Program Files' '/c/Program Files (x86)' -iname cryptcp.exe 2>/dev/null | head -1)"
+        CERTMGR="$(find '/c/Program Files' '/c/Program Files (x86)' -iname certmgr.exe 2>/dev/null | head -1)"
+        echo "cryptcp: $CRYPTCP"; echo "certmgr: $CERTMGR"
+        if [ -z "$CRYPTCP" ]; then
+          echo "cryptcp.exe not found — CryptoPro .exe tools present:"
+          find '/c/Program Files' '/c/Program Files (x86)' -ipath '*rypto*' -iname '*.exe' 2>/dev/null | head -40
+          exit 1
+        fi
         CA=http://cryptopro.ru/certsrv
         certs="$(cygpath -u "$RUNNER_TEMP")/certs"; mkdir -p "$certs"
         # trust the issuing CA root so the chain validates (Windows store, unlike Linux)
-        curl -sSL -k -o "$certs/cacert.cer" "$CA/certnew.cer?ReqID=CACert&Renewal=-1&Enc=bin"
+        curl -sSL -k -o "$(cygpath -w "$certs/cacert.cer")" "$CA/certnew.cer?ReqID=CACert&Renewal=-1&Enc=bin" || true
         certutil -enterprise -addstore -f root "$(cygpath -w "$certs/cacert.cer")" \
           || certutil -addstore -f root "$(cygpath -w "$certs/cacert.cer")" || true
         create_cert() {
